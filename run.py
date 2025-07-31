@@ -3,6 +3,9 @@ import psycopg2
 import requests
 import logging
 import configparser
+from datetime import datetime
+import uuid
+import re
 from psycopg2.extras import execute_values
 
 logger = logging.getLogger("DataImport")
@@ -12,19 +15,71 @@ class DataImport:
   base_url = "https://api.igdb.com/v4/dumps/"
   #endpoints = ["games","companies","covers","genres","keywords","platforms","release_dates"]
   endpoints = ["games"]
-  column_names = [
-    "id", "name", "slug", "url", "created_at", "updated_at", "summary", "storyline",
-    "collection", "franchise", "franchises", "hypes", "follows", "rating",
-    "aggregated_rating", "aggregated_rating_count", "total_rating", "total_rating_count",
-    "rating_count", "parent_game", "version_parent", "version_title", "similar_games",
-    "tags", "game_engines", "category", "player_perspectives", "game_modes", "keywords",
-    "themes", "genres", "expansions", "dlcs", "bundles", "standalone_expansions",
-    "first_release_date", "status", "platforms", "release_dates", "alternative_names",
-    "screenshots", "videos", "cover", "websites", "external_games", "multiplayer_modes",
-    "involved_companies", "age_ratings", "artworks", "checksum", "remakes", "remasters",
-    "expanded_games", "ports", "forks", "language_supports", "game_localizations",
-    "collections", "game_status", "game_type"
-  ]
+
+  column_names_with_types = {
+    "games": {
+      "id": "int",
+      "name": "text",
+      "slug": "text",
+      "url": "text",
+      "created_at": "timestamp",
+      "updated_at": "timestamp",
+      "summary": "text",
+      "storyline": "text",
+      "collection": "int",
+      "franchise": "int",
+      "franchises": "int_array",
+      "hypes": "int",
+      "follows": "int",
+      "rating": "float",
+      "aggregated_rating": "float",
+      "aggregated_rating_count": "int",
+      "total_rating": "float",
+      "total_rating_count": "int",
+      "rating_count": "int",
+      "parent_game": "int",
+      "version_parent": "int",
+      "version_title": "text",
+      "similar_games": "int_array",
+      "tags": "int_array",
+      "game_engines": "int_array",
+      "category": "int",
+      "player_perspectives": "int_array",
+      "game_modes": "int_array",
+      "keywords": "int_array",
+      "themes": "int_array",
+      "genres": "int_array",
+      "expansions": "int_array",
+      "dlcs": "int_array",
+      "bundles": "int_array",
+      "standalone_expansions": "int_array",
+      "first_release_date": "timestamp",
+      "status": "int",
+      "platforms": "int_array",
+      "release_dates": "int_array",
+      "alternative_names": "int_array",
+      "screenshots": "int_array",
+      "videos": "int_array",
+      "cover": "int",
+      "websites": "int_array",
+      "external_games": "int_array",
+      "multiplayer_modes": "int_array",
+      "involved_companies": "int_array",
+      "age_ratings": "int_array",
+      "artworks": "int_array",
+      "checksum": "uuid",
+      "remakes": "int_array",
+      "remasters": "int_array",
+      "expanded_games": "int_array",
+      "ports": "int_array",
+      "forks": "int_array",
+      "language_supports": "int_array",
+      "game_localizations": "int_array",
+      "collections": "int_array",
+      "game_status": "int",
+      "game_type": "int"
+    }
+  }
 
   client_id = ""
   client_secret = ""
@@ -95,66 +150,39 @@ class DataImport:
             {getUpdatedString(column_names)}
           WHERE igdb_{table_name}.updated_at < EXCLUDED.updated_at
       """
-
       data = []
-
       row_count = len(rows)
-      current_row = 0
-
-      for row in rows:
-        id_is_number = verifyInt(row["id"])
-        if (id_is_number == False):
-          logger.warning(f"Found broken record at id: {row["id"]}, skipping...")
-          continue
-        
-        # Some rows in the csv are inconsistent. Array types sometimes have an individual integer. 
-        # Below, we check if the column name is plural, and if the value is a single integer. If so, we cast to a list.
-        for col in column_names:
-          if (col.endswith("s") and (col != "status" and col != "hypes" and col != "game_status")):
-            if row[col] in (None, "", "null", "NULL"):
-              continue
-            if isinstance(row[col], list):
-              continue
-            if isinstance(row[col], str):
-              valueIsArray = row[col].endswith("}")
-              if valueIsArray == False:
-                row[col] = "{" + row[col] + "}"
-              else:
-                continue
-            
-        tempData = [row[col] if row[col] != "" else None for col in column_names]
-        data.append(tempData)
-        #TODO: row #89606 Wizard of Oz has the first_release_date value in the wrong column, resulting in an error where the statement tries to 
-        # insert a timestamp where it should be inserting NULL or a integer
-        # find a way to handle that.
-        if (tempData[0] == '269668'):
-          print("yo")
+      current_row = 1
+      logger.info(getUpdatedString(column_names))
+      for row in rows:         
+        data.append([row[col] if row[col] != "" else None for col in column_names])
         logger.info(f"Appending row with id: {row["id"]}, row {current_row} of {row_count}")
         current_row += 1
 
       execute_values(cur, sql, data, page_size=5000)
       conn.commit()
     
-  def run_upsert(self, csvs):
+  def run_upsert(self, sheets):
     connString = f"postgresql://{self.db_username}:{self.db_pass}@{self.db_host}/{self.db_name}"
 
     with psycopg2.connect(connString) as conn:
-        for obj in csvs:
-          self.upsert_rows(conn, obj["endpoint"], obj["file"], obj["columns"])
+        for sheet in sheets:
+          self.upsert_rows(conn, sheet["endpoint"], sheet["file"], sheet["columns"])
 
   def load_csvs(self):
     csvs = []
     for endpoint in self.endpoints:
       path = self.download_destination + endpoint + ".csv"
       data = self.parse_csv(path)
-      columns = list(data[0].keys())
-      obj = {
+      sheet_columns = list(data[0].keys())
+      columns = [f"{col}" for col in sheet_columns if col != '' and col != None]
+      sheet = {
         "columns": columns,
         "endpoint": endpoint,
         "file": data
       }
       logger.info(f"SUCCESS: Loaded csv for {endpoint} into csvs array")
-      csvs.append(obj)
+      csvs.append(sheet)
     
     return csvs
 
@@ -165,18 +193,73 @@ class DataImport:
   def write_csv(self, content, filepath):
     with open(filepath, mode="wb") as file:
       file.write(content)
+
+  def validateData(self, sheets):
+    for sheet in sheets:
+      endpoint = sheet["endpoint"]
+      columns_with_types = self.column_names_with_types[endpoint]
+      column_names = columns_with_types.keys()
+
+      rows = sheet["file"]
+
+      current_row = 1
+      num_rows = len(rows)
+
+      invalid_rows = []
+      valid_rows = []
+
+      for row in rows:
+        current_id = row["id"]
+        if current_id in (None, "", "None", "null"):
+          continue
+
+        logger.info(f"Validating Data Contained in row id: {current_id}, count: {current_row} of {num_rows} rows.")
+        current_row += 1
+
+        try:
+          for col in column_names:
+            data_type = columns_with_types[col]
+            value = row[col]
+
+            match data_type:
+              case "int":
+                parse_integer(value, col, current_id)
+              case "text":
+                parse_string(value, col, current_id)
+              case "timestamp":
+                parse_date(value, col, current_id)
+              case "int_array":
+                parse_integer_array(value, col, current_id)
+              case "float":
+                parse_float(value, col, current_id)
+              case "uuid":
+                parse_uuid(value, col, current_id)
+              case _:
+                logger.info("Invalid data type found in column")
+          row.pop('', None)
+          valid_rows.append(row)
+        except:
+          invalid_rows.append(row)
+          continue
+
+    logger.info(f"Valid Rows: {len(valid_rows)}")
+    logger.info(f"Invalid Rows: {len(invalid_rows)}")
+
+    sheet["file"] = valid_rows
+    return sheets
   
   def run(self):
-    #self.get_token()
-    #self.get_csv_from_igdb()
-    csvs = self.load_csvs()
-    self.run_upsert(csvs)
+    self.get_token()
+    self.get_csv_from_igdb()
+    sheets = self.load_csvs()
+    valid_data = self.validateData(sheets)
+    self.run_upsert(valid_data)
     
 def getParameterString(length):
   return ', '.join(['%s'] * length)
 
 def getUpdatedString(column_names):
-  return ', '.join([f"{col} = EXCLUDED.{col}" for col in column_names if col != 'id'])
+  return ', '.join([f"{col} = EXCLUDED.{col}" for col in column_names if col != 'id' and col != '' and col != None])
 
 def verifyInt(value):
   try:
@@ -185,6 +268,71 @@ def verifyInt(value):
   except:
     return False
   
+def parse_integer(value, col, id):
+  if value in (None, "", "None", "null"):
+    return
+  
+  try:
+    int(value)
+  except:
+    logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: int")
+    raise Exception
+
+def parse_string(value, col, id):
+  if value in (None, "", "None", "null"):
+    return
+  
+  try:
+    str(value)
+  except:
+    logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: text")
+    raise Exception
+
+def parse_integer_array(value, col, id):
+  if value in (None, "", "None", "null"):
+    return
+  
+  is_valid = bool(re.fullmatch(r"\{\s*(-?\d+\s*,\s*)*-?\d*\s*\}", value.strip()))
+
+  if not is_valid:
+    logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: int_array")
+    raise Exception
+
+def parse_date(value, col, id):
+  if value in (None, "", "None", "null"):
+    return
+  
+  errorsThrown = 0
+
+  for fmt in ("%Y-%m-%d", "%b %d, %Y", "%Y-%m-%dT%H:%M:%SZ"):
+    try:
+      return datetime.strptime(value, fmt)
+    except ValueError:
+      errorsThrown += 1
+
+  if errorsThrown == 2:
+    logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: timestamp")
+    raise Exception
+
+def parse_uuid(value, col, id):
+  if value in (None, "", "None", "null"):
+    return
+
+  try:
+    return str(uuid.UUID(value))  # Returns canonical string version
+  except ValueError:
+    logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: uuid")
+    raise Exception
+
+def parse_float(value, col, id):
+  if value in (None, "", "None", "null"):
+    return
+
+  try:
+    return float(value)
+  except ValueError:
+    logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: float")
+    raise Exception
 
 importer = DataImport()
 importer.run()
