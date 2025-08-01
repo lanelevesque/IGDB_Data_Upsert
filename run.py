@@ -11,10 +11,15 @@ from psycopg2.extras import execute_values
 logger = logging.getLogger("DataImport")
 logging.basicConfig(filename='dataimport.log', encoding='utf-8', level=logging.DEBUG)
 
+true_values = {"t", "true", "yes", "y", "1", "x", "on", "enabled", "active", "✓", "✔"}
+false_values = {"f", "false", "no", "n", "0", "", "off", "disabled", "inactive", "none", "null"}
+
+#exclude games with theme id of 42 (erotic)
+#exclude games with game_type of 5 (Mod)
+
 class DataImport:
   base_url = "https://api.igdb.com/v4/dumps/"
-  #endpoints = ["games","companies","covers","genres","keywords","platforms","release_dates"]
-  endpoints = ["games"]
+  endpoints = ["games","companies","covers","genres","keywords","platforms","release_dates"]
 
   column_names_with_types = {
     "games": {
@@ -78,6 +83,100 @@ class DataImport:
       "collections": "int_array",
       "game_status": "int",
       "game_type": "int"
+    },
+    "covers": {
+      "id": "int",
+      "url": "text",
+      "image_id": "text",
+      "width": "int",
+      "height": "int",
+      "alpha_channel": "bool",
+      "animated": "bool",
+      "game": "int",
+      "checksum": "uuid",
+      "game_localization": "int"
+    },
+    "companies": {
+      "id": "int",
+      "name": "text",
+      "created_at": "timestamp",
+      "updated_at": "timestamp",
+      "slug": "text",
+      "url": "text",
+      "logo": "int",
+      "description": "text",
+      "start_date": "timestamp",
+      "start_date_category": "int",
+      "country": "int",
+      "parent": "int",
+      "changed_company_id": "int",
+      "change_date": "timestamp",
+      "change_date_category": "int",
+      "twitter": "text",
+      "facebook": "text",
+      "published": "int_array",
+      "developed": "int_array",
+      "website": "int",
+      "websites": "int_array",
+      "checksum": "uuid",
+      "status": "int",
+      "start_date_format": "int",
+      "change_date_format": "int"
+    },
+    "genres": {
+      "id": "int",
+      "name": "text",
+      "created_at": "timestamp",
+      "updated_at": "timestamp",
+      "slug": "text",
+      "url": "text",
+      "checksum": "uuid"
+    },
+    "keywords": {
+      "id": "int",
+      "name": "text",
+      "created_at": "timestamp",
+      "updated_at": "timestamp",
+      "slug": "text",
+      "url": "text",
+      "checksum": "uuid"
+    },
+    "platforms": {
+      "id": "int",
+      "name": "text",
+      "slug": "text",
+      "url": "text",
+      "created_at": "timestamp",
+      "updated_at": "timestamp",
+      "summary": "text",
+      "category": "int",
+      "platform_family": "int",
+      "alternative_name": "text",
+      "generation": "int",
+      "versions": "int_array",
+      "abbreviation": "text",
+      "platform_logo": "int",
+      "websites": "int_array",
+      "checksum": "uuid",
+      "platform_type": "int"
+    },
+    "release_dates": {
+      "id": "int",
+      "game": "int",
+      "created_at": "timestamp",
+      "updated_at": "timestamp",
+      "category": "int",
+      "platform": "int",
+      "date": "timestamp",
+      "region": "int",
+      "y": "int",
+      "m": "int",
+      "human": "text",
+      "checksum": "uuid",
+      "status": "int",
+      "date_format": "int",
+      "release_region": "int",
+      "d": "int"
     }
   }
 
@@ -102,6 +201,13 @@ class DataImport:
     self.db_pass = config["database"]["password"]
     self.db_host = config["database"]["host"]
     self.db_name = config["database"]["dbname"]
+  
+  def run(self):
+    self.get_token()
+    self.get_csv_from_igdb()
+    sheets = self.load_csvs()
+    valid_data = self.validateData(sheets)
+    self.run_upsert(valid_data)
 
   def get_token(self):
     rsp = requests.post(self.token_url)
@@ -142,13 +248,14 @@ class DataImport:
 
   def upsert_rows(self, conn, table_name, rows, column_names):
     with conn.cursor() as cur:
+      use_updated = "updated_at" in column_names
       columns = ','.join(column_names)
       sql = f"""
           INSERT INTO igdb_{table_name} ({columns})
           VALUES %s
           ON CONFLICT (id) DO UPDATE SET
             {getUpdatedString(column_names)}
-          WHERE igdb_{table_name}.updated_at < EXCLUDED.updated_at
+          {f"WHERE igdb_{table_name}.updated_at < EXCLUDED.updated_at" if use_updated else ""}
       """
       data = []
       row_count = len(rows)
@@ -234,6 +341,9 @@ class DataImport:
                 parse_float(value, col, current_id)
               case "uuid":
                 parse_uuid(value, col, current_id)
+              case "bool":
+                bool_val = parse_bool(value, col, current_id)
+                row[col] = bool_val
               case _:
                 logger.info("Invalid data type found in column")
           row.pop('', None)
@@ -247,13 +357,6 @@ class DataImport:
 
     sheet["file"] = valid_rows
     return sheets
-  
-  def run(self):
-    self.get_token()
-    self.get_csv_from_igdb()
-    sheets = self.load_csvs()
-    valid_data = self.validateData(sheets)
-    self.run_upsert(valid_data)
     
 def getParameterString(length):
   return ', '.join(['%s'] * length)
@@ -333,6 +436,18 @@ def parse_float(value, col, id):
   except ValueError:
     logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: float")
     raise Exception
+  
+def parse_bool(value, col, id):
+  if value in (None, ""):
+    return False
+  
+  if value in true_values:
+    return True
+  if value in false_values:
+    return False
+  
+  logger.info(f"Found bad data at id: {id}, for column name: {col}, for data type: bool")
+  raise Exception
 
 importer = DataImport()
 importer.run()
